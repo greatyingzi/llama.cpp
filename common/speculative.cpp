@@ -777,6 +777,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int32_t last_tok  = 0;
     int dflash_ctx_max = 2048;
 
+    // Cached draft graph for reuse when draft_ctx is stable
+    ggml_context * cached_ctx = nullptr;
+    ggml_cgraph  * cached_gf  = nullptr;
+    ggml_tensor  * cached_inp_embed     = nullptr;
+    ggml_tensor  * cached_target_hidden = nullptr;
+    ggml_tensor  * cached_positions_q   = nullptr;
+    ggml_tensor  * cached_positions_k   = nullptr;
+    ggml_tensor  * cached_logits        = nullptr;
+    int            cached_draft_ctx     = 0;
+    bool           galloc_needs_alloc   = false;
+
+    // Cached MASK token embedding (avoid re-computing 15 identical embeddings)
+    std::vector<float> mask_embed_buf;
+    bool mask_embed_cached = false;
+
     // Buffers for noise block construction
     std::vector<float>   noise_embed_buf;
     std::vector<int32_t> noise_ids;
@@ -845,6 +860,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     ~common_speculative_state_dflash() override {
         if (galloc) ggml_gallocr_free(galloc);
+        if (cached_ctx) ggml_free(cached_ctx);
         // shared_dw is a shared_ptr, automatically freed when last reference dies
     }
 
@@ -872,30 +888,48 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         committed_pos = (int)prompt_tgt.size();
 
-        // 1) Noise block: [last_tok, MASK*15]
-        noise_ids[0] = id_last;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = mask_tok;
-
-        // Embed using target model's tok_embd via CPU ggml_get_rows
+        // 1) Build noise embedding: [last_tok_embd, MASK_embd * 15]
+        //    Cache the MASK embedding; only recompute last_tok embedding each call.
         {
-            // tok_embd may be quantized; use a small ggml graph with get_rows
-            // to dequantize on CPU
-            // Need space for: tensor overheads (ids, embd, output), graph overhead,
-            // ids data, and output data (hidden * q_len * sizeof(float))
-            const size_t embd_data = (size_t)DFLASH27B_TARGET_HIDDEN * q_len * sizeof(float);
+            // Compute last_tok embedding
             struct ggml_init_params embd_ip {
-                /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead() + sizeof(int32_t) * q_len + embd_data + 4096,
+                /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead() + sizeof(int32_t) + (size_t)hidden * sizeof(float) + 4096,
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ false,
             };
             ggml_context * embd_ctx = ggml_init(embd_ip);
-            ggml_tensor * ids_t = ggml_new_tensor_1d(embd_ctx, GGML_TYPE_I32, q_len);
-            memcpy(ids_t->data, noise_ids.data(), sizeof(int32_t) * q_len);
-            ggml_tensor * embd = ggml_get_rows(embd_ctx, tgt_tok_embd, ids_t);
+            ggml_tensor * id_t = ggml_new_tensor_1d(embd_ctx, GGML_TYPE_I32, 1);
+            ((int32_t *)id_t->data)[0] = id_last;
+            ggml_tensor * embd = ggml_get_rows(embd_ctx, tgt_tok_embd, id_t);
             ggml_cgraph * embd_gf = ggml_new_graph(embd_ctx);
             ggml_build_forward_expand(embd_gf, embd);
             ggml_graph_compute_with_ctx(embd_ctx, embd_gf, 1);
-            memcpy(noise_embed_buf.data(), embd->data, sizeof(float) * hidden * q_len);
+
+            // Cache MASK embedding on first use
+            if (!mask_embed_cached) {
+                mask_embed_buf.resize(hidden);
+                struct ggml_init_params m_ip {
+                    /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead() + sizeof(int32_t) + (size_t)hidden * sizeof(float) + 4096,
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ false,
+                };
+                ggml_context * m_ctx = ggml_init(m_ip);
+                ggml_tensor * m_id = ggml_new_tensor_1d(m_ctx, GGML_TYPE_I32, 1);
+                ((int32_t *)m_id->data)[0] = mask_tok;
+                ggml_tensor * m_embd = ggml_get_rows(m_ctx, tgt_tok_embd, m_id);
+                ggml_cgraph * m_gf = ggml_new_graph(m_ctx);
+                ggml_build_forward_expand(m_gf, m_embd);
+                ggml_graph_compute_with_ctx(m_ctx, m_gf, 1);
+                memcpy(mask_embed_buf.data(), m_embd->data, sizeof(float) * hidden);
+                ggml_free(m_ctx);
+                mask_embed_cached = true;
+            }
+
+            // Assemble: [last_tok, MASK, MASK, ...]
+            memcpy(noise_embed_buf.data(), embd->data, sizeof(float) * hidden);
+            for (int i = 1; i < q_len; i++) {
+                memcpy(noise_embed_buf.data() + i * hidden, mask_embed_buf.data(), sizeof(float) * hidden);
+            }
             ggml_free(embd_ctx);
         }
 
@@ -904,51 +938,60 @@ struct common_speculative_state_dflash : public common_speculative_state {
         const int draft_start = committed_pos - draft_ctx;
         if (draft_ctx == 0) return;
 
-        // 3) Build the draft graph
-        ggml_init_params gip{};
-        gip.mem_size   = 256u * 1024u * 1024u;
-        gip.mem_buffer = nullptr;
-        gip.no_alloc   = true;
-        ggml_context * ctx0 = ggml_init(gip);
+        // 3) Build or reuse the draft graph
+        const bool rebuild = (draft_ctx != cached_draft_ctx);
+        if (rebuild) {
+            // Free previous cached graph
+            if (cached_ctx) ggml_free(cached_ctx);
 
-        ggml_tensor * inp_embed     = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hidden, q_len, 1);
-        ggml_tensor * target_hidden = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, fc_in, draft_ctx, 1);
-        ggml_tensor * positions_q   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, q_len);
-        ggml_tensor * positions_k   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, draft_ctx + q_len);
-        ggml_set_name(inp_embed, "inp_embed");         ggml_set_input(inp_embed);
-        ggml_set_name(target_hidden, "target_hidden");  ggml_set_input(target_hidden);
-        ggml_set_name(positions_q, "positions_q");     ggml_set_input(positions_q);
-        ggml_set_name(positions_k, "positions_k");     ggml_set_input(positions_k);
+            ggml_init_params gip{};
+            gip.mem_size   = 256u * 1024u * 1024u;
+            gip.mem_buffer = nullptr;
+            gip.no_alloc   = true;
+            cached_ctx = ggml_init(gip);
 
-        dflash27b::DraftGraphInputs gi{};
-        gi.ctx_len           = draft_ctx;
-        gi.noise_embed       = inp_embed;
-        gi.target_hidden_cat = target_hidden;
-        gi.positions_q       = positions_q;
-        gi.positions_k       = positions_k;
-        gi.lm_head           = tgt_output;
+            cached_inp_embed     = ggml_new_tensor_3d(cached_ctx, GGML_TYPE_F32, hidden, q_len, 1);
+            cached_target_hidden = ggml_new_tensor_3d(cached_ctx, GGML_TYPE_F32, fc_in, draft_ctx, 1);
+            cached_positions_q   = ggml_new_tensor_1d(cached_ctx, GGML_TYPE_I32, q_len);
+            cached_positions_k   = ggml_new_tensor_1d(cached_ctx, GGML_TYPE_I32, draft_ctx + q_len);
+            ggml_set_name(cached_inp_embed, "inp_embed");         ggml_set_input(cached_inp_embed);
+            ggml_set_name(cached_target_hidden, "target_hidden"); ggml_set_input(cached_target_hidden);
+            ggml_set_name(cached_positions_q, "positions_q");     ggml_set_input(cached_positions_q);
+            ggml_set_name(cached_positions_k, "positions_k");     ggml_set_input(cached_positions_k);
 
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 4096, false);
-        auto go = dflash27b::build_draft_graph(ctx0, *dw_ptr, gi);
-        ggml_set_output(go.logits);
-        ggml_build_forward_expand(gf, go.logits);
+            dflash27b::DraftGraphInputs gi{};
+            gi.ctx_len           = draft_ctx;
+            gi.noise_embed       = cached_inp_embed;
+            gi.target_hidden_cat = cached_target_hidden;
+            gi.positions_q       = cached_positions_q;
+            gi.positions_k       = cached_positions_k;
+            gi.lm_head           = tgt_output;
 
-        // Reset gallocr each call to avoid stale allocation issues
-        if (galloc) ggml_gallocr_free(galloc);
-        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(dw_ptr->backend));
+            cached_gf = ggml_new_graph_custom(cached_ctx, 4096, false);
+            auto go = dflash27b::build_draft_graph(cached_ctx, *dw_ptr, gi);
+            ggml_set_output(go.logits);
+            ggml_build_forward_expand(cached_gf, go.logits);
+            cached_logits = go.logits;
 
-        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-            LOG_ERR("%s: draft graph alloc failed\n", __func__);
-            ggml_free(ctx0);
-            return;
+            // Reuse or create gallocr (reuse existing allocation when graph grows)
+            if (!galloc) {
+                galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(dw_ptr->backend));
+            }
+            if (!ggml_gallocr_alloc_graph(galloc, cached_gf)) {
+                LOG_ERR("%s: draft graph alloc failed\n", __func__);
+                ggml_free(cached_ctx); cached_ctx = nullptr;
+                cached_draft_ctx = 0;
+                return;
+            }
+
+            cached_draft_ctx = draft_ctx;
         }
 
         // 4) Set input data
-        ggml_backend_tensor_set(inp_embed, noise_embed_buf.data(), 0,
+        ggml_backend_tensor_set(cached_inp_embed, noise_embed_buf.data(), 0,
                                 sizeof(float) * noise_embed_buf.size());
 
         // Copy target_feat ring buffer → target_hidden (bf16→f32)
-        // Use ggml_cpy through the same backend to ensure correct stream synchronization
         {
             const int cap = tgt_feat_cap;
             const int slot0 = draft_start % cap;
@@ -963,26 +1006,23 @@ struct common_speculative_state_dflash : public common_speculative_state {
             ggml_context * cpy_ctx = ggml_init(cpy_ip);
             ggml_cgraph * cpy_gf = ggml_new_graph(cpy_ctx);
 
-            // First slice: feat_buf[slot0..slot0+pre_n) → target_hidden[0..pre_n)
             {
                 ggml_tensor * src = ggml_view_2d(cpy_ctx, tgt_feat_buf,
                     fc_in, pre_n, tgt_feat_buf->nb[1],
                     (size_t)slot0 * tgt_feat_buf->nb[1]);
-                ggml_tensor * dst = ggml_view_2d(cpy_ctx, target_hidden,
-                    fc_in, pre_n, target_hidden->nb[1], 0);
+                ggml_tensor * dst = ggml_view_2d(cpy_ctx, cached_target_hidden,
+                    fc_in, pre_n, cached_target_hidden->nb[1], 0);
                 ggml_build_forward_expand(cpy_gf, ggml_cpy(cpy_ctx, src, dst));
             }
-            // Second slice: feat_buf[0..post_n) → target_hidden[pre_n..pre_n+post_n)
             if (post_n > 0) {
                 ggml_tensor * src = ggml_view_2d(cpy_ctx, tgt_feat_buf,
                     fc_in, post_n, tgt_feat_buf->nb[1], 0);
-                ggml_tensor * dst = ggml_view_2d(cpy_ctx, target_hidden,
-                    fc_in, post_n, target_hidden->nb[1],
-                    (size_t)pre_n * target_hidden->nb[1]);
+                ggml_tensor * dst = ggml_view_2d(cpy_ctx, cached_target_hidden,
+                    fc_in, post_n, cached_target_hidden->nb[1],
+                    (size_t)pre_n * cached_target_hidden->nb[1]);
                 ggml_build_forward_expand(cpy_gf, ggml_cpy(cpy_ctx, src, dst));
             }
 
-            // Compute the copy through the same backend (ensures stream sync)
             ggml_backend_graph_compute(dw_ptr->backend, cpy_gf);
             ggml_free(cpy_ctx);
         }
@@ -991,19 +1031,18 @@ struct common_speculative_state_dflash : public common_speculative_state {
         for (int i = 0; i < q_len; i++) pos_q_buf[i] = draft_ctx + i;
         pos_k_buf.resize(draft_ctx + q_len);
         for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf[i] = i;
-        ggml_backend_tensor_set(positions_q, pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
-        ggml_backend_tensor_set(positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
+        ggml_backend_tensor_set(cached_positions_q, pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
+        ggml_backend_tensor_set(cached_positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
 
         // 5) Compute
-        auto st = ggml_backend_graph_compute(dw_ptr->backend, gf);
+        auto st = ggml_backend_graph_compute(dw_ptr->backend, cached_gf);
         if (st != GGML_STATUS_SUCCESS) {
             LOG_ERR("%s: draft compute failed: %d\n", __func__, (int)st);
-            ggml_free(ctx0);
             return;
         }
 
         // 6) Extract draft tokens via argmax
-        ggml_backend_tensor_get(go.logits, draft_logits_buf.data(), 0,
+        ggml_backend_tensor_get(cached_logits, draft_logits_buf.data(), 0,
                                 sizeof(float) * draft_logits_buf.size());
 
         std::vector<int32_t> draft_tok(q_len);
@@ -1024,7 +1063,6 @@ struct common_speculative_state_dflash : public common_speculative_state {
         }
 
         last_tok = id_last;
-        ggml_free(ctx0);
     }
 
     void accept(uint16_t n_accepted) override {
