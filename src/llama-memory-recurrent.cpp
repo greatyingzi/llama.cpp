@@ -1,6 +1,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
@@ -152,30 +153,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    // models like Mamba or RWKV can't have a state partially erased at the end
-    // of the sequence because their state isn't preserved for previous tokens
     if (seq_id >= (int64_t) size) {
         // could be fatal
         return false;
     }
-    if (0 <= seq_id) {
-        int32_t & tail_id = cells[seq_id].tail;
-        if (tail_id >= 0) {
-            const auto & cell = cells[tail_id];
-            // partial intersection is invalid if it includes the final pos
-            if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: partial intersection is invalid, so returning false, p0 = %d, cell.pos = %d, p1 = %d\n", p0, cell.pos, p1);
-                return false;
-            }
-            // invalidate tails which will be cleared
-            if (p0 <= cell.pos && cell.pos < p1) {
-                tail_id = -1;
-            }
-        }
-    } else {
+    if (seq_id < 0) {
         // seq_id is negative, then the range should include everything or nothing
         if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
-            //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
             return false;
         }
     }
@@ -198,6 +182,21 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 cells[i].src = -1;
                 if (new_head == size) {
                     new_head = i;
+                }
+            }
+        }
+    }
+
+    // Update tail: find the cell with highest position still belonging to seq_id
+    if (seq_id >= 0) {
+        int32_t & tail_id = cells[seq_id].tail;
+        if (tail_id < 0 || !cells[tail_id].has_seq_id(seq_id)) {
+            tail_id = -1;
+            llama_pos max_pos = -1;
+            for (uint32_t i = 0; i < size; ++i) {
+                if (cells[i].has_seq_id(seq_id) && cells[i].pos > max_pos) {
+                    max_pos = cells[i].pos;
+                    tail_id = i;
                 }
             }
         }
@@ -424,6 +423,163 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
     GGML_UNUSED(optimize);
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
+}
+
+llama_memory_recurrent::snapshot llama_memory_recurrent::snapshot_state(llama_seq_id seq_id) const {
+    snapshot snap;
+    snap.cells.resize(cells.size());
+    for (size_t i = 0; i < cells.size(); i++) {
+        snap.cells[i].pos  = cells[i].pos;
+        snap.cells[i].src  = cells[i].src;
+        snap.cells[i].src0 = cells[i].src0;
+        snap.cells[i].tail = cells[i].tail;
+    }
+    snap.head  = head;
+    snap.used  = used;
+
+    // Copy R and S tensor data for all layers to CPU
+    snap.r_data.resize(r_l.size());
+    snap.s_data.resize(s_l.size());
+    for (size_t il = 0; il < r_l.size(); il++) {
+        if (r_l[il]) {
+            snap.r_data[il].resize(ggml_nbytes(r_l[il]));
+            ggml_backend_tensor_get(r_l[il], snap.r_data[il].data(), 0, snap.r_data[il].size());
+        }
+        if (s_l[il]) {
+            snap.s_data[il].resize(ggml_nbytes(s_l[il]));
+            ggml_backend_tensor_get(s_l[il], snap.s_data[il].data(), 0, snap.s_data[il].size());
+        }
+    }
+    return snap;
+}
+
+void llama_memory_recurrent::restore_state(const snapshot & snap, llama_seq_id seq_id) {
+    for (size_t i = 0; i < cells.size() && i < snap.cells.size(); i++) {
+        cells[i].pos  = snap.cells[i].pos;
+        cells[i].src  = snap.cells[i].src;
+        cells[i].src0 = snap.cells[i].src0;
+        cells[i].tail = snap.cells[i].tail;
+    }
+    head  = snap.head;
+    used  = snap.used;
+
+    // Write R and S tensor data back to backend buffer
+    for (size_t il = 0; il < r_l.size() && il < snap.r_data.size(); il++) {
+        if (r_l[il] && !snap.r_data[il].empty()) {
+            ggml_backend_tensor_set(r_l[il], snap.r_data[il].data(), 0, snap.r_data[il].size());
+        }
+    }
+    for (size_t il = 0; il < s_l.size() && il < snap.s_data.size(); il++) {
+        if (s_l[il] && !snap.s_data[il].empty()) {
+            ggml_backend_tensor_set(s_l[il], snap.s_data[il].data(), 0, snap.s_data[il].size());
+        }
+    }
+}
+
+llama_memory_recurrent::snapshot_gpu llama_memory_recurrent::snapshot_state_gpu(llama_seq_id seq_id) const {
+    snapshot_gpu snap;
+
+    // Copy cell metadata (small, stays on CPU)
+    snap.cells.resize(cells.size());
+    for (size_t i = 0; i < cells.size(); i++) {
+        snap.cells[i].pos  = cells[i].pos;
+        snap.cells[i].src  = cells[i].src;
+        snap.cells[i].src0 = cells[i].src0;
+        snap.cells[i].tail = cells[i].tail;
+    }
+    snap.head = head;
+    snap.used = used;
+
+    // Allocate GPU tensors for R and S copies
+    if (r_l.empty() || !r_l[0] || !r_l[0]->buffer) return snap;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r_l[0]->buffer);
+
+    // Create ggml context and allocate tensors
+    struct ggml_init_params gip;
+    gip.mem_size   = ggml_tensor_overhead() * (r_l.size() + s_l.size()) * 2 + 4096;
+    gip.mem_buffer = nullptr;
+    gip.no_alloc   = true;
+    snap.ctx.reset(ggml_init(gip));
+
+    snap.r_l.resize(r_l.size(), nullptr);
+    snap.s_l.resize(s_l.size(), nullptr);
+
+    for (size_t il = 0; il < r_l.size(); il++) {
+        if (r_l[il]) {
+            snap.r_l[il] = ggml_dup_tensor(snap.ctx.get(), r_l[il]);
+            ggml_format_name(snap.r_l[il], "snap_r_l%d", (int)il);
+        }
+        if (s_l[il]) {
+            snap.s_l[il] = ggml_dup_tensor(snap.ctx.get(), s_l[il]);
+            ggml_format_name(snap.s_l[il], "snap_s_l%d", (int)il);
+        }
+    }
+
+    // Allocate backend buffer on same device
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(snap.ctx.get(), buft);
+    if (!buf) {
+        return snap;
+    }
+    snap.buf.reset(buf);
+
+    // GPU->GPU copy of R and S tensors
+    for (size_t il = 0; il < r_l.size(); il++) {
+        if (r_l[il] && snap.r_l[il]) {
+            ggml_backend_tensor_copy(r_l[il], snap.r_l[il]);
+        }
+        if (s_l[il] && snap.s_l[il]) {
+            ggml_backend_tensor_copy(s_l[il], snap.s_l[il]);
+        }
+    }
+
+    return snap;
+}
+
+void llama_memory_recurrent::update_snapshot_gpu(snapshot_gpu & snap, llama_seq_id seq_id) const {
+    // Update cell metadata
+    for (size_t i = 0; i < cells.size() && i < snap.cells.size(); i++) {
+        snap.cells[i].pos  = cells[i].pos;
+        snap.cells[i].src  = cells[i].src;
+        snap.cells[i].src0 = cells[i].src0;
+        snap.cells[i].tail = cells[i].tail;
+    }
+    snap.head = head;
+    snap.used = used;
+
+    // Re-copy R and S data (GPU->GPU, no allocation)
+    for (size_t il = 0; il < r_l.size() && il < snap.r_l.size(); il++) {
+        if (r_l[il] && snap.r_l[il]) {
+            ggml_backend_tensor_copy(r_l[il], snap.r_l[il]);
+        }
+        if (s_l[il] && snap.s_l[il]) {
+            ggml_backend_tensor_copy(s_l[il], snap.s_l[il]);
+        }
+    }
+}
+
+void llama_memory_recurrent::restore_state_gpu(const snapshot_gpu & snap, llama_seq_id seq_id) {
+    // Restore cell metadata
+    for (size_t i = 0; i < cells.size() && i < snap.cells.size(); i++) {
+        cells[i].pos  = snap.cells[i].pos;
+        cells[i].src  = snap.cells[i].src;
+        cells[i].src0 = snap.cells[i].src0;
+        cells[i].tail = snap.cells[i].tail;
+    }
+    head = snap.head;
+    used = snap.used;
+
+    // GPU->GPU copy back to R and S tensors
+    for (size_t il = 0; il < r_l.size() && il < snap.r_l.size(); il++) {
+        if (r_l[il] && snap.r_l[il]) {
+            ggml_backend_tensor_copy(snap.r_l[il], r_l[il]);
+        }
+    }
+    for (size_t il = 0; il < s_l.size() && il < snap.s_l.size(); il++) {
+        if (s_l[il] && snap.s_l[il]) {
+            ggml_backend_tensor_copy(snap.s_l[il], s_l[il]);
+        }
+    }
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {

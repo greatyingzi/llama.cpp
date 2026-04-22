@@ -105,6 +105,11 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // DFlash: enable/disable hidden state capture at layers {1,16,31,46,61}
+    void set_dflash_capture(bool enable);
+    ggml_tensor * get_dflash_feat_buf() const;
+    int get_dflash_feat_cap() const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -326,6 +331,13 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+
+    // DFlash: hidden state capture for speculative decoding
+    bool dflash_capture = false;
+    ggml_tensor * dflash_feat_buf = nullptr;  // [5*n_embd, cap] bf16 ring buffer
+    ggml_context * dflash_feat_ctx = nullptr;
+    ggml_backend_buffer_t dflash_feat_buf_buf = nullptr;
+    int dflash_feat_cap = 4096;  // ring buffer capacity in positions
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

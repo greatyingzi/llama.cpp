@@ -3495,6 +3495,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_MODEL_DRAFT"));
     add_opt(common_arg(
+        {"--dflash-draft"}, "FNAME",
+        "DFlash draft model GGUF for speculative decoding (hidden-state conditioned draft)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.dflash_draft_path = value;
+            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DFLASH_DRAFT"));
+    add_opt(common_arg(
+        {"--dflash-ctx-max"}, "N",
+        string_format("max context positions fed to DFlash draft model (default: %d)", params.speculative.dflash_ctx_max),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("dflash-ctx-max must be >= 1");
+            }
+            params.speculative.dflash_ctx_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-replace"}, "TARGET", "DRAFT",
         "translate the string in TARGET into DRAFT if the draft model and main model are not compatible",
         [](common_params & params, const std::string & tgt, const std::string & dft) {
@@ -3502,7 +3520,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|dflash]",
         string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {

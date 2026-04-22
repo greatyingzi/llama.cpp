@@ -53,6 +53,52 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // Snapshot/restore for speculative decoding rollback
+    struct snapshot {
+        // per-cell metadata
+        struct cell_snap {
+            llama_pos pos  = -1;
+            int32_t   src  = -1;
+            int32_t   src0 = -1;
+            int32_t   tail = -1;
+        };
+        std::vector<cell_snap> cells;
+        uint32_t head = 0;
+        uint32_t used = 0;
+        // Per-layer R and S tensor data (CPU copies)
+        std::vector<std::vector<uint8_t>> r_data;
+        std::vector<std::vector<uint8_t>> s_data;
+    };
+
+    // GPU-resident snapshot for fast rollback
+    struct snapshot_gpu {
+        struct cell_snap {
+            llama_pos pos  = -1;
+            int32_t   src  = -1;
+            int32_t   src0 = -1;
+            int32_t   tail = -1;
+        };
+        std::vector<cell_snap> cells;
+        uint32_t head = 0;
+        uint32_t used = 0;
+        // Per-layer GPU-resident R and S tensor copies
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        std::vector<ggml_tensor *> r_l;
+        std::vector<ggml_tensor *> s_l;
+    };
+
+    // Save state snapshot (copies R/S tensor data to CPU)
+    snapshot snapshot_state(llama_seq_id seq_id) const;
+    // Save state snapshot (GPU-resident, fast GPU->GPU copy)
+    snapshot_gpu snapshot_state_gpu(llama_seq_id seq_id) const;
+    // Update existing snapshot (re-copy data, reuse GPU allocation)
+    void update_snapshot_gpu(snapshot_gpu & snap, llama_seq_id seq_id) const;
+    // Restore state from snapshot (writes R/S back to backend buffer)
+    void restore_state(const snapshot & snap, llama_seq_id seq_id);
+    // Restore state from GPU-resident snapshot (fast GPU->GPU copy)
+    void restore_state_gpu(const snapshot_gpu & snap, llama_seq_id seq_id);
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there

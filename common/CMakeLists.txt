@@ -109,6 +109,45 @@ add_library(${TARGET} STATIC
 target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
+# DFlash integration: add include paths and link dflash27b library
+set(DFLASH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../")
+target_include_directories(${TARGET} PRIVATE
+    ${DFLASH_ROOT}/include
+    ${DFLASH_ROOT}/src
+)
+
+if (TARGET dflash27b)
+    target_link_libraries(${TARGET} PRIVATE dflash27b)
+elseif(EXISTS "${DFLASH_ROOT}/src/qwen3_dflash_graph.cpp")
+    # Build dflash27b sources directly into common when building from llama.cpp tree
+    # (the llama-server build won't have the parent dflash27b target)
+    add_library(dflash27b_embed STATIC
+        ${DFLASH_ROOT}/src/errors.cpp
+        ${DFLASH_ROOT}/src/safetensors_draft.cpp
+        ${DFLASH_ROOT}/src/gguf_draft_loader.cpp
+        ${DFLASH_ROOT}/src/qwen3_dflash_graph.cpp
+    )
+    # Only compile CUDA sources when CUDA is enabled
+    if(GGML_CUDA)
+        enable_language(CUDA)
+        target_sources(dflash27b_embed PRIVATE ${DFLASH_ROOT}/src/f16_convert.cu)
+    endif()
+    target_include_directories(dflash27b_embed PRIVATE
+        ${DFLASH_ROOT}/include
+        ${DFLASH_ROOT}/src
+    )
+    target_link_libraries(dflash27b_embed PUBLIC ggml)
+    if(TARGET ggml-cuda)
+        target_link_libraries(dflash27b_embed PUBLIC ggml-cuda)
+    endif()
+    # Link CUDA runtime when f16_convert.cu is compiled
+    if(GGML_CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(dflash27b_embed PUBLIC CUDA::cudart)
+    endif()
+    target_link_libraries(${TARGET} PUBLIC dflash27b_embed)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()

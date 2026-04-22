@@ -67,6 +67,51 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // DFlash: capture hidden states at layers {1,16,31,46,61}
+        if (params.dflash_feat_buf) {
+            static const int DFLASH_CAP_LAYERS[5] = { 1, 16, 31, 46, 61 };
+            int capture_idx = -1;
+            for (int k = 0; k < 5; k++) {
+                if (DFLASH_CAP_LAYERS[k] == il) { capture_idx = k; break; }
+            }
+            if (capture_idx >= 0) {
+                const int hidden = n_embd;
+                const int cap = params.dflash_feat_cap;
+                ggml_tensor * feat_buf = params.dflash_feat_buf;
+                const size_t elt = ggml_element_size(feat_buf);
+                const size_t col_stride = feat_buf->nb[1];
+
+                // Use absolute token positions from the ubatch to index the ring buffer
+                const llama_pos pos0 = params.ubatch.pos[0];
+                const int slot_start = (int)(pos0 % cap);
+                const int pre_n  = std::min((int)n_tokens, cap - slot_start);
+                const int post_n = (int)n_tokens - pre_n;
+
+                ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, hidden, n_tokens);
+
+                // First slice: [slot_start..slot_start+pre_n)
+                {
+                    const size_t offset = (size_t)slot_start * col_stride
+                                        + (size_t)capture_idx * hidden * elt;
+                    ggml_tensor * dst = ggml_view_2d(ctx0, feat_buf,
+                        hidden, pre_n, col_stride, offset);
+                    ggml_tensor * src = ggml_view_2d(ctx0, cur_2d,
+                        hidden, pre_n, cur_2d->nb[1], 0);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+                }
+                // Second slice: wrap-around at [0..post_n) if needed
+                if (post_n > 0) {
+                    const size_t offset = (size_t)capture_idx * hidden * elt;
+                    ggml_tensor * dst = ggml_view_2d(ctx0, feat_buf,
+                        hidden, post_n, col_stride, offset);
+                    ggml_tensor * src = ggml_view_2d(ctx0, cur_2d,
+                        hidden, post_n, cur_2d->nb[1],
+                        (size_t)pre_n * cur_2d->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+                }
+            }
+        }
+
         // Input for next layer
         inpL = cur;
     }

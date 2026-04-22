@@ -58,6 +58,15 @@ struct server_slot {
 
     common_speculative * spec = nullptr;
 
+    // SSM state snapshot for speculative decoding rollback (hybrid models)
+    llama_ssm_snapshot_gpu_t ssm_snap = nullptr;
+    int64_t t_ssm_snap_us = 0;
+    int64_t t_ssm_restore_us = 0;
+    int64_t t_ssm_replay_us = 0;
+
+    // Inline replay: re-process tokens after SSM rollback in next speculative batch
+    int dflash_replay_start = -1;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -400,6 +409,12 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        if (t_ssm_snap_us > 0 || t_ssm_restore_us > 0 || t_ssm_replay_us > 0) {
+            SLT_CNT(*this,
+                    "ssm rollback timing: snap=%.1fms restore=%.1fms replay=%.1fms\n",
+                    t_ssm_snap_us / 1000.0, t_ssm_restore_us / 1000.0, t_ssm_replay_us / 1000.0);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -767,7 +782,12 @@ private:
 
         slots.clear();
 
-        const bool can_spec = common_speculative_is_compat(ctx);
+        bool can_spec = common_speculative_is_compat(ctx);
+        if (!can_spec && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            // DFlash handles recurrent memory cleanup directly in seq_rm
+            can_spec = true;
+            SRV_INF("%s", "DFlash speculative decoding: bypassing seq_rm compat check\n");
+        }
         if (!can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -2112,6 +2132,16 @@ private:
 
                 const auto & params_spec = slot.task->params.speculative;
 
+                // Inline replay: re-process tokens from previous SSM rollback
+                // to advance recurrent state before generating new draft
+                if (slot.dflash_replay_start >= 0) {
+                    const auto & ptokens = slot.prompt.tokens;
+                    for (int i = slot.dflash_replay_start; i < (int)ptokens.size(); i++) {
+                        common_batch_add(batch, ptokens[i], i, { slot.id }, true);
+                    }
+                    slot.dflash_replay_start = -1;
+                }
+
                 llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
 
                 if (draft.size() > (size_t) n_draft_max) {
@@ -2141,6 +2171,19 @@ private:
                         slot.prompt.tokens.push_back(draft[i]);
                     }
                     slot.drafted = std::move(draft);
+
+                    // Snapshot SSM state before verify (for hybrid model rollback)
+                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        const int64_t t_snap0 = ggml_time_us();
+                        if (slot.ssm_snap) {
+                            // Reuse existing GPU allocation, just re-copy data
+                            llama_ssm_snapshot_gpu_update(ctx, slot.ssm_snap, slot.id);
+                        } else {
+                            slot.ssm_snap = llama_ssm_snapshot_gpu(ctx, slot.id);
+                        }
+                        const int64_t t_snap1 = ggml_time_us();
+                        slot.t_ssm_snap_us += (t_snap1 - t_snap0);
+                    }
                 }
             } else {
                 // no speculative decoding
@@ -2937,7 +2980,35 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                // For DFlash with hybrid models: restore SSM state on partial rejection
+                // then replay accepted tokens to advance SSM state correctly
+                const bool partial_reject = (size_t)(ids.size() - 1) < n_draft;
+                if (partial_reject && slot.ssm_snap && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    // Restore SSM to pre-verify state
+                    {
+                        const int64_t t0 = ggml_time_us();
+                        llama_ssm_restore_gpu(ctx, slot.ssm_snap, slot.id);
+                        slot.t_ssm_restore_us += (ggml_time_us() - t0);
+                    }
+
+                    const int n_accepted = (int)ids.size() - 1;
+                    const int pos_before_draft = slot.prompt.n_tokens() - n_accepted;
+
+                    // Clear ALL draft positions (accepted + rejected) from memory
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, pos_before_draft, -1);
+
+                    // Inline replay: include accepted tokens in the next speculative batch
+                    // instead of a separate llama_decode call. Replays from the sampled
+                    // token position (pos_before_draft - 1) through prompt end to re-advance SSM.
+                    slot.dflash_replay_start = pos_before_draft - 1;
+                } else {
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                    slot.dflash_replay_start = -1;
+                }
+                if (slot.ssm_snap) {
+                    llama_ssm_snapshot_gpu_free(slot.ssm_snap);
+                    slot.ssm_snap = nullptr;
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

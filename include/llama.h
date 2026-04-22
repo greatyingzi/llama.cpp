@@ -561,6 +561,7 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    LLAMA_API ggml_backend_sched_t       llama_get_sched   (struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -983,6 +984,29 @@ extern "C" {
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+
+    // DFlash: enable/disable hidden state capture for speculative decoding
+    LLAMA_API void llama_set_dflash_capture(struct llama_context * ctx, bool enable);
+    LLAMA_API struct ggml_tensor * llama_get_dflash_feat_buf(struct llama_context * ctx);
+    LLAMA_API int llama_get_dflash_feat_cap(struct llama_context * ctx);
+
+    // Get model weight tensors (for DFlash draft model access)
+    LLAMA_API struct ggml_tensor * llama_model_get_tok_embd(const struct llama_model * model);
+    LLAMA_API struct ggml_tensor * llama_model_get_output   (const struct llama_model * model);
+
+    // DFlash: snapshot/restore recurrent (SSM) state for speculative decoding rollback
+    // Returns an opaque handle; call llama_ssm_snapshot_free to release
+    typedef void * llama_ssm_snapshot_t;
+    LLAMA_API llama_ssm_snapshot_t llama_ssm_snapshot(struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API void llama_ssm_restore(struct llama_context * ctx, llama_ssm_snapshot_t snap, llama_seq_id seq_id);
+    LLAMA_API void llama_ssm_snapshot_free(llama_ssm_snapshot_t snap);
+
+    // GPU-resident variant: avoids GPU->CPU->GPU round-trip
+    typedef void * llama_ssm_snapshot_gpu_t;
+    LLAMA_API llama_ssm_snapshot_gpu_t llama_ssm_snapshot_gpu(struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API void llama_ssm_snapshot_gpu_update(struct llama_context * ctx, llama_ssm_snapshot_gpu_t snap, llama_seq_id seq_id);
+    LLAMA_API void llama_ssm_restore_gpu(struct llama_context * ctx, llama_ssm_snapshot_gpu_t snap, llama_seq_id seq_id);
+    LLAMA_API void llama_ssm_snapshot_gpu_free(llama_ssm_snapshot_gpu_t snap);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

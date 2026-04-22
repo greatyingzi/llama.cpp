@@ -567,6 +567,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // DFlash: hidden state capture buffer (nullptr if capture disabled)
+    ggml_tensor * dflash_feat_buf = nullptr;
+    int dflash_feat_cap = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {

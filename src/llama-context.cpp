@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1063,6 +1064,44 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_dflash_capture(bool enable) {
+    if (dflash_capture == enable) return;
+    dflash_capture = enable;
+    if (enable && !dflash_feat_buf) {
+        // Allocate ring buffer: [5*n_embd, cap] bf16
+        const int64_t n_embd = model.hparams.n_embd;
+        const int64_t n_cap  = dflash_feat_cap;
+        struct ggml_init_params ip {
+            /*.mem_size   =*/ ggml_tensor_overhead() + 64,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        dflash_feat_ctx = ggml_init(ip);
+        dflash_feat_buf = ggml_new_tensor_2d(dflash_feat_ctx, GGML_TYPE_BF16,
+                                              5 * n_embd, n_cap);
+        ggml_set_name(dflash_feat_buf, "dflash_feat_buf");
+        // Allocate on the first non-CPU backend (GPU)
+        ggml_backend_t backend_gpu = nullptr;
+        for (auto & b : backends) {
+            if (b.get() != backend_cpu) { backend_gpu = b.get(); break; }
+        }
+        if (!backend_gpu) backend_gpu = backend_cpu;
+        dflash_feat_buf_buf = ggml_backend_alloc_ctx_tensors(dflash_feat_ctx, backend_gpu);
+        ggml_backend_buffer_clear(dflash_feat_buf_buf, 0);
+        LLAMA_LOG_DEBUG("%s: allocated dflash_feat_buf [%ld x %ld] bf16\n",
+                        __func__, (long)(5*n_embd), (long)n_cap);
+    }
+    sched_need_reserve = true;
+}
+
+ggml_tensor * llama_context::get_dflash_feat_buf() const {
+    return dflash_feat_buf;
+}
+
+int llama_context::get_dflash_feat_cap() const {
+    return dflash_feat_cap;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2166,6 +2205,8 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.dflash_feat_buf =*/ dflash_capture ? dflash_feat_buf : nullptr,
+        /*.dflash_feat_cap =*/ dflash_feat_cap,
     };
 }
 
@@ -3040,6 +3081,10 @@ const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
 
+ggml_backend_sched_t llama_get_sched(llama_context * ctx) {
+    return ctx->get_sched();
+}
+
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
     return ctx->pooling_type();
 }
@@ -3081,6 +3126,86 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_dflash_capture(llama_context * ctx, bool enable) {
+    ctx->set_dflash_capture(enable);
+}
+
+ggml_tensor * llama_get_dflash_feat_buf(llama_context * ctx) {
+    return ctx->get_dflash_feat_buf();
+}
+
+int llama_get_dflash_feat_cap(llama_context * ctx) {
+    return ctx->get_dflash_feat_cap();
+}
+
+ggml_tensor * llama_model_get_tok_embd(const llama_model * model) {
+    return model->tok_embd;
+}
+
+ggml_tensor * llama_model_get_output(const llama_model * model) {
+    return model->output;
+}
+
+// SSM snapshot/restore for speculative decoding
+static llama_memory_recurrent * get_recurrent_mem(llama_context * ctx) {
+    llama_memory_t mem = ctx->get_memory();
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    if (hybrid) return hybrid->get_mem_recr();
+    auto * recr = dynamic_cast<llama_memory_recurrent *>(mem);
+    return recr;
+}
+
+llama_ssm_snapshot_t llama_ssm_snapshot(llama_context * ctx, llama_seq_id seq_id) {
+    auto * recr = get_recurrent_mem(ctx);
+    if (!recr) return nullptr;
+    auto * snap = new llama_memory_recurrent::snapshot(recr->snapshot_state(seq_id));
+    return static_cast<llama_ssm_snapshot_t>(snap);
+}
+
+void llama_ssm_restore(llama_context * ctx, llama_ssm_snapshot_t snap, llama_seq_id seq_id) {
+    if (!snap) return;
+    auto * recr = get_recurrent_mem(ctx);
+    if (!recr) return;
+    auto * s = static_cast<llama_memory_recurrent::snapshot *>(snap);
+    recr->restore_state(*s, seq_id);
+}
+
+// GPU-resident snapshot API
+struct ssm_snapshot_gpu_wrap {
+    llama_memory_recurrent::snapshot_gpu snap;
+};
+
+llama_ssm_snapshot_gpu_t llama_ssm_snapshot_gpu(llama_context * ctx, llama_seq_id seq_id) {
+    auto * recr = get_recurrent_mem(ctx);
+    if (!recr) return nullptr;
+    auto * s = new ssm_snapshot_gpu_wrap{recr->snapshot_state_gpu(seq_id)};
+    return static_cast<llama_ssm_snapshot_gpu_t>(s);
+}
+
+void llama_ssm_snapshot_gpu_update(llama_context * ctx, llama_ssm_snapshot_gpu_t snap, llama_seq_id seq_id) {
+    if (!snap) return;
+    auto * recr = get_recurrent_mem(ctx);
+    if (!recr) return;
+    auto * s = static_cast<ssm_snapshot_gpu_wrap *>(snap);
+    recr->update_snapshot_gpu(s->snap, seq_id);
+}
+
+void llama_ssm_restore_gpu(llama_context * ctx, llama_ssm_snapshot_gpu_t snap, llama_seq_id seq_id) {
+    if (!snap) return;
+    auto * recr = get_recurrent_mem(ctx);
+    if (!recr) return;
+    auto * s = static_cast<ssm_snapshot_gpu_wrap *>(snap);
+    recr->restore_state_gpu(s->snap, seq_id);
+}
+
+void llama_ssm_snapshot_gpu_free(llama_ssm_snapshot_gpu_t snap) {
+    delete static_cast<ssm_snapshot_gpu_wrap *>(snap);
+}
+
+void llama_ssm_snapshot_free(llama_ssm_snapshot_t snap) {
+    delete static_cast<llama_memory_recurrent::snapshot *>(snap);
 }
 
 void llama_synchronize(llama_context * ctx) {

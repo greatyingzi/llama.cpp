@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include <cmath>
+
 #include "common.h"
 #include "ggml.h"
 #include "llama.h"
@@ -8,6 +10,11 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+
+// DFlash headers (relative to dflash project root)
+#include "dflash27b.h"
+#include "dflash_graph.h"
+#include "internal.h"
 
 #include <algorithm>
 #include <cstring>
@@ -25,7 +32,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    COMMON_SPECULATIVE_TYPE_DFLASH
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -36,7 +44,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 struct common_speculative_config {
@@ -737,6 +746,292 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
     }
 };
 
+// ──── DFlash speculative state ────────────────────────────────────
+
+// Shared DFlash weights (loaded once, used by all slots)
+struct common_params_speculative::dflash_shared_weights {
+    dflash27b::DraftWeights dw;
+    ~dflash_shared_weights() {
+        dflash27b::free_draft_weights(dw);
+    }
+};
+
+struct common_speculative_state_dflash : public common_speculative_state {
+    llama_context * ctx_tgt;
+
+    // Shared draft weights (owned by params, not per-slot)
+    std::shared_ptr<common_params_speculative::dflash_shared_weights> shared_dw;
+    dflash27b::DraftWeights * dw_ptr = nullptr;  // convenience pointer into shared_dw
+
+    // Persistent graph allocator (avoids repeated cudaMalloc)
+    ggml_gallocr_t galloc = nullptr;
+
+    // Cached target model pointers
+    ggml_tensor * tgt_tok_embd = nullptr;
+    ggml_tensor * tgt_output   = nullptr;
+    ggml_tensor * tgt_feat_buf = nullptr;
+    int           tgt_feat_cap = 0;
+
+    // Position tracking
+    int committed_pos = 0;
+    int32_t last_tok  = 0;
+    int dflash_ctx_max = 2048;
+
+    // Buffers for noise block construction
+    std::vector<float>   noise_embed_buf;
+    std::vector<int32_t> noise_ids;
+    std::vector<int32_t> pos_q_buf;
+    std::vector<int32_t> pos_k_buf;
+    std::vector<float>   draft_logits_buf;
+
+    common_speculative_state_dflash(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            common_params_speculative & params)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , shared_dw(params.dflash_weights)
+        , dflash_ctx_max(params.dflash_ctx_max)
+    {
+        const int hidden = DFLASH27B_TARGET_HIDDEN;
+        const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
+        const int vocab  = DFLASH27B_TARGET_VOCAB;
+
+        noise_embed_buf.resize((size_t)hidden * q_len);
+        noise_ids.resize(q_len);
+        pos_q_buf.resize(q_len);
+        draft_logits_buf.resize((size_t)vocab * q_len);
+
+        // Get CUDA backend from the target model's scheduler
+        ggml_backend_sched_t sched = llama_get_sched(ctx_tgt);
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, 0);
+
+        // Load draft weights once, share across all slots
+        if (!params.dflash_weights) {
+            params.dflash_weights = std::make_shared<common_params_speculative::dflash_shared_weights>();
+            params.dflash_weights->dw.backend = backend;
+            if (!dflash27b::load_draft_gguf(params.dflash_draft_path, backend, params.dflash_weights->dw)) {
+                LOG_ERR("%s: failed to load DFlash draft weights from %s\n",
+                        __func__, params.dflash_draft_path.c_str());
+                params.dflash_weights.reset();
+                return;
+            }
+        }
+        shared_dw = params.dflash_weights;
+        dw_ptr = &shared_dw->dw;
+
+        // Get target model tensors
+        const llama_model * model = llama_get_model(ctx_tgt);
+        tgt_tok_embd = llama_model_get_tok_embd(model);
+        tgt_output   = llama_model_get_output(model);
+        tgt_feat_cap = llama_get_dflash_feat_cap(ctx_tgt);
+
+        if (!tgt_tok_embd || !tgt_output) {
+            LOG_ERR("%s: failed to get target model tensors\n", __func__);
+            return;
+        }
+
+        // Enable hidden state capture on the target context (allocates feat_buf)
+        llama_set_dflash_capture(ctx_tgt, true);
+
+        // Get feat_buf AFTER capture is enabled (which allocates it)
+        tgt_feat_buf = llama_get_dflash_feat_buf(ctx_tgt);
+
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(dw_ptr->backend));
+
+        LOG_INF("%s: DFlash draft model loaded, ctx_max=%d, feat_cap=%d\n",
+                __func__, dflash_ctx_max, tgt_feat_cap);
+    }
+
+    ~common_speculative_state_dflash() override {
+        if (galloc) ggml_gallocr_free(galloc);
+        // shared_dw is a shared_ptr, automatically freed when last reference dies
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        committed_pos = (int)prompt.size();
+    }
+
+    void draft(const common_params_speculative & params,
+               const llama_tokens & prompt_tgt,
+               llama_token id_last,
+               llama_tokens & result) override {
+        GGML_UNUSED(params);
+
+        if (!tgt_feat_buf || !tgt_output || !dw_ptr->fc) {
+            return;
+        }
+
+        llama_synchronize(ctx_tgt);
+
+        const int hidden = DFLASH27B_TARGET_HIDDEN;
+        const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
+        const int vocab  = DFLASH27B_TARGET_VOCAB;
+        const int mask_tok = DFLASH27B_DRAFT_MASK_TOKEN_ID;
+        const int fc_in  = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
+
+        committed_pos = (int)prompt_tgt.size();
+
+        // 1) Noise block: [last_tok, MASK*15]
+        noise_ids[0] = id_last;
+        for (int i = 1; i < q_len; i++) noise_ids[i] = mask_tok;
+
+        // Embed using target model's tok_embd via CPU ggml_get_rows
+        {
+            // tok_embd may be quantized; use a small ggml graph with get_rows
+            // to dequantize on CPU
+            // Need space for: tensor overheads (ids, embd, output), graph overhead,
+            // ids data, and output data (hidden * q_len * sizeof(float))
+            const size_t embd_data = (size_t)DFLASH27B_TARGET_HIDDEN * q_len * sizeof(float);
+            struct ggml_init_params embd_ip {
+                /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead() + sizeof(int32_t) * q_len + embd_data + 4096,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ false,
+            };
+            ggml_context * embd_ctx = ggml_init(embd_ip);
+            ggml_tensor * ids_t = ggml_new_tensor_1d(embd_ctx, GGML_TYPE_I32, q_len);
+            memcpy(ids_t->data, noise_ids.data(), sizeof(int32_t) * q_len);
+            ggml_tensor * embd = ggml_get_rows(embd_ctx, tgt_tok_embd, ids_t);
+            ggml_cgraph * embd_gf = ggml_new_graph(embd_ctx);
+            ggml_build_forward_expand(embd_gf, embd);
+            ggml_graph_compute_with_ctx(embd_ctx, embd_gf, 1);
+            memcpy(noise_embed_buf.data(), embd->data, sizeof(float) * hidden * q_len);
+            ggml_free(embd_ctx);
+        }
+
+        // 2) Draft context window
+        const int draft_ctx   = std::min(committed_pos, dflash_ctx_max);
+        const int draft_start = committed_pos - draft_ctx;
+        if (draft_ctx == 0) return;
+
+        // 3) Build the draft graph
+        ggml_init_params gip{};
+        gip.mem_size   = 256u * 1024u * 1024u;
+        gip.mem_buffer = nullptr;
+        gip.no_alloc   = true;
+        ggml_context * ctx0 = ggml_init(gip);
+
+        ggml_tensor * inp_embed     = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hidden, q_len, 1);
+        ggml_tensor * target_hidden = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, fc_in, draft_ctx, 1);
+        ggml_tensor * positions_q   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, q_len);
+        ggml_tensor * positions_k   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, draft_ctx + q_len);
+        ggml_set_name(inp_embed, "inp_embed");         ggml_set_input(inp_embed);
+        ggml_set_name(target_hidden, "target_hidden");  ggml_set_input(target_hidden);
+        ggml_set_name(positions_q, "positions_q");     ggml_set_input(positions_q);
+        ggml_set_name(positions_k, "positions_k");     ggml_set_input(positions_k);
+
+        dflash27b::DraftGraphInputs gi{};
+        gi.ctx_len           = draft_ctx;
+        gi.noise_embed       = inp_embed;
+        gi.target_hidden_cat = target_hidden;
+        gi.positions_q       = positions_q;
+        gi.positions_k       = positions_k;
+        gi.lm_head           = tgt_output;
+
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 4096, false);
+        auto go = dflash27b::build_draft_graph(ctx0, *dw_ptr, gi);
+        ggml_set_output(go.logits);
+        ggml_build_forward_expand(gf, go.logits);
+
+        // Reset gallocr each call to avoid stale allocation issues
+        if (galloc) ggml_gallocr_free(galloc);
+        galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(dw_ptr->backend));
+
+        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+            LOG_ERR("%s: draft graph alloc failed\n", __func__);
+            ggml_free(ctx0);
+            return;
+        }
+
+        // 4) Set input data
+        ggml_backend_tensor_set(inp_embed, noise_embed_buf.data(), 0,
+                                sizeof(float) * noise_embed_buf.size());
+
+        // Copy target_feat ring buffer → target_hidden (bf16→f32)
+        // Use ggml_cpy through the same backend to ensure correct stream synchronization
+        {
+            const int cap = tgt_feat_cap;
+            const int slot0 = draft_start % cap;
+            const int pre_n = std::min(draft_ctx, cap - slot0);
+            const int post_n = draft_ctx - pre_n;
+
+            struct ggml_init_params cpy_ip {
+                /*.mem_size   =*/ ggml_tensor_overhead() * 8 + ggml_graph_overhead() + 4096,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * cpy_ctx = ggml_init(cpy_ip);
+            ggml_cgraph * cpy_gf = ggml_new_graph(cpy_ctx);
+
+            // First slice: feat_buf[slot0..slot0+pre_n) → target_hidden[0..pre_n)
+            {
+                ggml_tensor * src = ggml_view_2d(cpy_ctx, tgt_feat_buf,
+                    fc_in, pre_n, tgt_feat_buf->nb[1],
+                    (size_t)slot0 * tgt_feat_buf->nb[1]);
+                ggml_tensor * dst = ggml_view_2d(cpy_ctx, target_hidden,
+                    fc_in, pre_n, target_hidden->nb[1], 0);
+                ggml_build_forward_expand(cpy_gf, ggml_cpy(cpy_ctx, src, dst));
+            }
+            // Second slice: feat_buf[0..post_n) → target_hidden[pre_n..pre_n+post_n)
+            if (post_n > 0) {
+                ggml_tensor * src = ggml_view_2d(cpy_ctx, tgt_feat_buf,
+                    fc_in, post_n, tgt_feat_buf->nb[1], 0);
+                ggml_tensor * dst = ggml_view_2d(cpy_ctx, target_hidden,
+                    fc_in, post_n, target_hidden->nb[1],
+                    (size_t)pre_n * target_hidden->nb[1]);
+                ggml_build_forward_expand(cpy_gf, ggml_cpy(cpy_ctx, src, dst));
+            }
+
+            // Compute the copy through the same backend (ensures stream sync)
+            ggml_backend_graph_compute(dw_ptr->backend, cpy_gf);
+            ggml_free(cpy_ctx);
+        }
+
+        // Position buffers
+        for (int i = 0; i < q_len; i++) pos_q_buf[i] = draft_ctx + i;
+        pos_k_buf.resize(draft_ctx + q_len);
+        for (int i = 0; i < draft_ctx + q_len; i++) pos_k_buf[i] = i;
+        ggml_backend_tensor_set(positions_q, pos_q_buf.data(), 0, sizeof(int32_t) * q_len);
+        ggml_backend_tensor_set(positions_k, pos_k_buf.data(), 0, sizeof(int32_t) * (draft_ctx + q_len));
+
+        // 5) Compute
+        auto st = ggml_backend_graph_compute(dw_ptr->backend, gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            LOG_ERR("%s: draft compute failed: %d\n", __func__, (int)st);
+            ggml_free(ctx0);
+            return;
+        }
+
+        // 6) Extract draft tokens via argmax
+        ggml_backend_tensor_get(go.logits, draft_logits_buf.data(), 0,
+                                sizeof(float) * draft_logits_buf.size());
+
+        std::vector<int32_t> draft_tok(q_len);
+        for (int i = 0; i < q_len; i++) {
+            const float * logits_i = draft_logits_buf.data() + (size_t)i * vocab;
+            int32_t best = 0;
+            float best_val = logits_i[0];
+            for (int v = 1; v < vocab; v++) {
+                if (logits_i[v] > best_val) { best_val = logits_i[v]; best = v; }
+            }
+            draft_tok[i] = best;
+        }
+        draft_tok[0] = id_last; // pin position 0
+
+        // Return positions 1..q_len-1
+        for (int i = 1; i < q_len; i++) {
+            result.push_back(draft_tok[i]);
+        }
+
+        last_tok = id_last;
+        ggml_free(ctx0);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        committed_pos += n_accepted;
+    }
+};
+
 struct common_speculative {
     std::vector<std::unique_ptr<common_speculative_state>> impls; // list of implementations to use and their states
     common_speculative_state * curr_impl = nullptr; // current implementation in use (for stats)
@@ -786,6 +1081,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
         default:                                    return "unknown";
     }
 }
@@ -860,6 +1156,8 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
 
+        bool has_dflash = !params.dflash_draft_path.empty();
+
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
         if (has_ngram_simple) {
@@ -897,6 +1195,9 @@ common_speculative * common_speculative_init(
         }
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
+        }
+        if (has_dflash) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
         }
     }
 
@@ -953,6 +1254,11 @@ common_speculative * common_speculative_init(
                 auto state = create_state_ngram_cache(
                         params.lookup_cache_static, params.lookup_cache_dynamic, config);
                 impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                impls.push_back(std::make_unique<common_speculative_state_dflash>(
+                    config.type, ctx_tgt, params));  // pass original params for shared weight update
                 break;
             }
             default:

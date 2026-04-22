@@ -177,6 +177,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash speculative decoding (hidden-state conditioned draft)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -351,6 +352,14 @@ struct common_params_speculative {
 
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // DFlash speculative decoding
+    std::string dflash_draft_path;                                     // NOLINT
+    int32_t     dflash_ctx_max = 2048; // max context positions fed to draft model
+
+    // Shared draft weights (loaded once, used by all slots)
+    struct dflash_shared_weights;
+    std::shared_ptr<dflash_shared_weights> dflash_weights;
 
     bool has_dft() const {
         return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
